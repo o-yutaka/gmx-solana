@@ -47,8 +47,13 @@
 #      external-programs/chainlink-store.so (ships in the tree,
 #      no build) and/or a built mock verifier .so — see the
 #      TODO-VERIFY at program_test() in gt_referral_close_time.rs.
-#   3. setup.sh's avm route works headless (no TTY); fallback is
-#      the cargo-install route quoted inside setup.sh itself.
+#   3. Anchor CLI is OPTIONAL and best-effort in setup.sh: the
+#      suites build via cargo-build-sbf and test via cargo test
+#      and never invoke anchor. setup.sh builds avm under a newer
+#      toolchain (its deps need edition2024, which the pinned
+#      Rust 1.81 cargo cannot parse — that failure killed run
+#      40901967661 in setup) and continues with a warning if the
+#      anchor install fails anyway.
 
 name: run-pocs
 
@@ -183,6 +188,16 @@ jobs:
           df -h / | tee -a poc-logs/disk.txt
 
       - name: Run freeze suite
+        # Host-side test build must NOT use the pinned Rust 1.81:
+        # the test dependency graph (url -> idna_adapter -> icu 2.0)
+        # requires rustc >= 1.82, which killed run #4 at dependency
+        # resolution ("rustc 1.81.0 is not supported by the following
+        # packages: icu_* ... requires rustc 1.82"). The SBF .so
+        # files are already built by then and load as binaries, so
+        # compiling the host harness under stable is safe. setup.sh
+        # already leaves a stable toolchain installed (avm build).
+        env:
+          RUSTUP_TOOLCHAIN: stable
         run: |
           set -o pipefail
           BPF_OUT_PATH="$PWD/target/deploy" \
@@ -204,7 +219,7 @@ jobs:
 
   # ------------------------------------------------------------------
   # Referral suite: programs/store/tests/gt_referral_close_time.rs
-  # Expected: 4 passed (cases 1-4 in README-c1.md).
+  # Expected: 5 passed (redesigned cases 1-5 in README-c1.md).
   # ------------------------------------------------------------------
   referral:
     if: ${{ inputs.suite == 'both' || inputs.suite == 'referral' }}
@@ -281,15 +296,20 @@ jobs:
           df -h / | tee -a poc-logs/disk.txt
 
       - name: Run referral suite
+        # Same MSRV override as the freeze job (see there): the
+        # host test graph needs rustc >= 1.82, not the pinned 1.81.
+        env:
+          RUSTUP_TOOLCHAIN: stable
         run: |
           set -o pipefail
           BPF_OUT_PATH="$PWD/target/deploy" \
             cargo test -p gmsol-store --test gt_referral_close_time \
               -- --nocapture 2>&1 | tee poc-logs/referral.log
-          # Expected tail: "test result: ok. 4 passed; 0 failed".
-          # Per README-c1.md: if Case 2 or Case 4 fails, suspect
-          # the fixture, not the finding; if Case 1/3 fail with
-          # 2/4 green, that is a genuine refutation — report it.
+          # Expected tail: "test result: ok. 5 passed; 0 failed".
+          # Per README-c1.md: if a control (Case 2/4) fails, suspect
+          # the fixture, not the finding; Case 3 failing refutes
+          # Form 1; Case 1 failing needs the assert-level triage in
+          # README-c1.md; Case 5 is the set-once negative control.
 
       - name: Upload logs
         if: always()
