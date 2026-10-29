@@ -539,6 +539,32 @@ async fn setup() -> Fixture {
     )
     .await;
 
+    // -- Transfer the store receiver to the treasury receiver PDA
+    //    BEFORE treasury InitializeConfig (this step was missing and
+    //    killed run #7). Treasury's init CPIs store accept_receiver
+    //    with next_receiver = the treasury receiver PDA, and the store
+    //    only accepts when that key equals the store's pending
+    //    next_receiver (PermissionDenied 6004 otherwise). After store
+    //    Initialize with receiver=None, receiver AND next_receiver
+    //    both default to the payer/admin, so the CPI's PDA never
+    //    matches. The current receiver (admin = context payer)
+    //    authorises the transfer, so no extra signer is needed. ------
+    send_ok(
+        &mut ctx,
+        &[ix(
+            gmsol_store::ID,
+            gmsol_store::accounts::TransferReceiver {
+                authority: admin.pubkey(),
+                store,
+                next_receiver: receiver,
+            },
+            gmsol_store::instruction::TransferReceiver {},
+        )],
+        &[],
+        "transfer store receiver to treasury receiver",
+    )
+    .await;
+
     // -- Treasury config (permissionless init), then grant the Config
     //    PDA GT_CONTROLLER: Treasury's completion CPI calls the
     //    GT-controller-gated V1 close with the Config PDA as authority.
