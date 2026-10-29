@@ -299,7 +299,11 @@ async fn token_amount(ctx: &mut ProgramTestContext, address: &Pubkey) -> u64 {
 /// `gmsol_sdk::utils::zero_copy::ZeroCopy<T>` reads the same accounts.
 /// If it does not hold, swap this helper for the SDK's `ZeroCopy<T>`.
 fn load_zero_copy<T: bytemuck::Pod>(data: &[u8]) -> T {
-    let start = anchor_lang::Discriminator::LENGTH;
+    // Anchor account discriminator length (8 bytes). NOTE:
+    // `anchor_lang::Discriminator` is a trait, so its associated
+    // constant cannot be referenced without a concrete type
+    // (run #5's E0782); the literal keeps the offset logic above.
+    let start = 8;
     let end = start + std::mem::size_of::<T>();
     *bytemuck::from_bytes::<T>(&data[start..end])
 }
@@ -595,7 +599,7 @@ async fn setup() -> Fixture {
         &mut ctx,
         &[ix(
             gmsol_treasury::ID,
-            gmsol_treasury::accounts::SetGtFactor {
+            gmsol_treasury::accounts::UpdateConfig {
                 authority: keeper.pubkey(),
                 store,
                 config,
@@ -613,7 +617,7 @@ async fn setup() -> Fixture {
         &mut ctx,
         &[ix(
             gmsol_treasury::ID,
-            gmsol_treasury::accounts::SetBuybackFactor {
+            gmsol_treasury::accounts::UpdateConfig {
                 authority: keeper.pubkey(),
                 store,
                 config,
@@ -630,12 +634,13 @@ async fn setup() -> Fixture {
 
     // -- Payout token fixture -------------------------------------------
     let payout_mint = Keypair::new();
-    // TODO-VERIFY: `BanksClient::get_rent` return type in
-    // solana-program-test 2.1 (Rent directly vs. io::Result<Rent>).
+    // `BanksClient::get_rent` returns `io::Result<Rent>` in
+    // solana-program-test 2.1 (confirmed by run #5's E0599).
     let rent = ctx
         .banks_client
         .get_rent()
         .await
+        .expect("get_rent")
         .minimum_balance(anchor_spl::token::spl_token::state::Mint::LEN);
     send_ok(
         &mut ctx,
@@ -932,7 +937,7 @@ fn request_v2_ix(f: &Fixture, authority: &Pubkey, rent_payer: &Pubkey) -> Instru
 fn confirm_vault_ix(f: &Fixture) -> Instruction {
     ix(
         gmsol_store::ID,
-        gmsol_store::accounts::ConfirmGtExchangeVaultV2 {
+        gmsol_store::accounts::ConfirmGtExchangeVault {
             authority: f.keeper.pubkey(),
             store: f.store,
             vault: f.vault,
@@ -1105,7 +1110,7 @@ async fn freeze_variant_b_delegate_authority_sponsor_payer() {
         &mut f.ctx,
         &[ix(
             gmsol_store::ID,
-            gmsol_store::accounts::SetGtDelegate {
+            gmsol_store::accounts::UpdateGtDelegation {
                 owner: owner.pubkey(),
                 store: f.store,
                 user: user_address(&f.store, &owner.pubkey()),
@@ -1340,7 +1345,8 @@ async fn setup_oracle_and_feed(
 #[ignore = "requires the oracle price-feed fixture (TODO-VERIFY, see README)"]
 async fn control_owner_payer_full_payout_with_confirmed_bank() {
     let mut f = setup().await;
-    let (token_map, oracle, feed) = setup_oracle_and_feed(&mut f, &f.payout_mint).await;
+    let payout_mint = f.payout_mint;
+    let (token_map, oracle, feed) = setup_oracle_and_feed(&mut f, &payout_mint).await;
 
     let owner = f.owner.insecure_clone();
     let request_ix = request_v2_ix(&f, &owner.pubkey(), &owner.pubkey());
