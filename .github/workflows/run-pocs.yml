@@ -1,0 +1,301 @@
+# GMTrade PoCs — GitHub Actions runner pack.
+#
+# PLACEMENT: commit this file into your PUBLIC fork of
+# gmsol-labs/gmx-solana at:
+#
+#     .github/workflows/run-pocs.yml
+#
+# together with the pack files under poc-pack/ (see
+# README-actions.md for the exact source -> destination map).
+# Public fork = standard GitHub-hosted runners are free and
+# unmetred, which is the whole point of this venue (Codespaces
+# quota is finite; Actions minutes on public repos are not).
+#
+# DESIGN NOTES
+# - Manual trigger only (workflow_dispatch), with a suite selector.
+#   The two suites run as SEPARATE jobs in parallel, so one suite's
+#   failure never hides the other's result.
+# - Each job checks out the fork at the PINNED analysed ref
+#   (a10a659…, NOT the fork's moving main), then materialises
+#   poc-pack/ from the fork's default branch (the branch you
+#   dispatched from), then runs poc-pack/setup.sh — the very same
+#   script the Codespaces pack uses (toolchain pins, test-file
+#   placement, dev-deps snippets all live there, not duplicated
+#   here). Build/test commands mirror README.md / README-c1.md
+#   (the same commands the Codespaces run_all.sh wraps).
+# - DISK IS THE BINDING CONSTRAINT: a standard Linux runner starts
+#   with only ~14 GB free SSD (brief figure), while run_poc.sh
+#   budgets ~25 GB free for a full workspace build. Mitigations,
+#   in order: (1) an early free-disk-space step, (2) debug info
+#   disabled for host builds (CARGO_PROFILE_*_DEBUG=0), (3) SBF
+#   programs built ONLY for the packages the suite under test
+#   actually loads (freeze: store+treasury; referral: store),
+#   instead of a full `anchor build` of all 24+ programs,
+#   (4) cargo test already targets a single package (-p).
+# - Full logs are tee'd to poc-logs/ and uploaded as artifacts
+#   (if: always()), including a df snapshot, so a disk failure is
+#   diagnosable after the fact.
+#
+# TODO-VERIFY (resolve on the first run; see README-actions.md):
+#   1. cargo-build-sbf ships with the anza/agave 2.1.21 installer
+#      and emits target/deploy/gmsol_store.so / gmsol_treasury.so.
+#      If not, replace the "Build SBF programs" steps with a plain
+#      `anchor build` (heavier; only viable thanks to the
+#      free-disk step).
+#   2. The referral suite's ProgramTest loads gmsol_store only, or
+#      also needs the repo's prebuilt
+#      external-programs/chainlink-store.so (ships in the tree,
+#      no build) and/or a built mock verifier .so — see the
+#      TODO-VERIFY at program_test() in gt_referral_close_time.rs.
+#   3. setup.sh's avm route works headless (no TTY); fallback is
+#      the cargo-install route quoted inside setup.sh itself.
+
+name: run-pocs
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "Which PoC suite to run"
+        required: true
+        type: choice
+        default: both
+        options:
+          - both
+          - freeze
+          - referral
+
+permissions:
+  contents: read
+
+# One manual run at a time per ref; a second dispatch queues
+# instead of racing the first for the caches.
+concurrency:
+  group: run-pocs-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Keep in sync with REPO_REF in poc-pack/setup.sh.
+  GMSOL_REF: a10a6599a42442aac2b4873fb058616a40e07f27
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Slim host builds: debug info is the single biggest target-dir
+  # multiplier and neither suite needs it.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  # ------------------------------------------------------------------
+  # Freeze suite: programs/treasury/tests/gt_exchange_freeze.rs
+  # Expected: 5 passed; 1 ignored (Tier-2 positive control is
+  # #[ignore]d — it needs the oracle price-feed fixture).
+  # ------------------------------------------------------------------
+  freeze:
+    if: ${{ inputs.suite == 'both' || inputs.suite == 'freeze' }}
+    name: freeze (gt_exchange_freeze)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - name: Check out fork at pinned ref
+        uses: actions/checkout@v4
+        with:
+          # Literal SHA (not the fork's main): the PoCs are written
+          # against exactly this tree. Keep in sync with
+          # poc-pack/setup.sh REPO_REF.
+          ref: a10a6599a42442aac2b4873fb058616a40e07f27
+
+      - name: Free disk space
+        run: |
+          mkdir -p poc-logs
+          { echo "=== before ==="; df -h /; } | tee poc-logs/disk.txt
+          # Preinstalled payloads this job never uses. Every line is
+          # best-effort (image contents drift between runner
+          # releases): a missing path must not fail the job.
+          # TODO-VERIFY the df delta on the first run.
+          sudo rm -rf /usr/local/lib/android || true   # Android SDK/NDK (~10 GB, est.)
+          sudo rm -rf /usr/share/dotnet || true        # .NET (~2-3 GB, est.)
+          sudo rm -rf /opt/ghc "$HOME/.ghcup" || true  # Haskell (~4-6 GB, est.)
+          sudo rm -rf /usr/local/share/boost || true   # Boost headers (~1 GB, est.)
+          docker system prune -af || true              # pre-pulled images (~3-6 GB, est.)
+          sudo apt-get clean || true
+          { echo "=== after ==="; df -h /; } | tee -a poc-logs/disk.txt
+
+      - name: Fetch poc-pack from the fork's default branch
+        run: |
+          # The workspace is checked out at the pinned ref, which
+          # predates the pack. Pull ONLY poc-pack/ from the branch
+          # this run was dispatched from (your fork's default
+          # branch, where you committed the pack).
+          git fetch --depth 1 origin "${{ github.ref_name }}"
+          git checkout FETCH_HEAD -- poc-pack
+          ls -la poc-pack
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-
+
+      - name: Cache target dir (freeze)
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: target-freeze-${{ env.GMSOL_REF }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            target-freeze-${{ env.GMSOL_REF }}-
+        # NOTE: GitHub caps a repo's total cache at 10 GB (LRU
+        # eviction). A solana workspace target/ can approach or
+        # exceed that on its own, so this cache may fail to save or
+        # evict the registry cache. If the first run shows that,
+        # delete this step — the registry cache alone still skips
+        # the dependency download on later runs. See
+        # README-actions.md ("Caching").
+
+      - name: Setup toolchain + install PoC files (codespaces setup.sh)
+        run: bash poc-pack/setup.sh
+
+      - name: Put toolchain on PATH for later steps
+        run: |
+          # setup.sh's PATH exports die with its own shell; persist
+          # them for the build/test steps.
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build SBF programs (store + treasury only)
+        run: |
+          # The freeze suite's ProgramTest registers exactly
+          # gmsol_store + gmsol_treasury (see the test source), so
+          # build only those two .so files instead of the whole
+          # workspace. TODO-VERIFY #1 (above): if cargo-build-sbf
+          # is missing from the agave install, fall back to
+          # `anchor build` here.
+          mkdir -p target/deploy
+          cargo build-sbf --manifest-path programs/store/Cargo.toml \
+            --sbf-out-dir target/deploy
+          cargo build-sbf --manifest-path programs/treasury/Cargo.toml \
+            --sbf-out-dir target/deploy
+          ls -la target/deploy
+          df -h / | tee -a poc-logs/disk.txt
+
+      - name: Run freeze suite
+        run: |
+          set -o pipefail
+          BPF_OUT_PATH="$PWD/target/deploy" \
+            cargo test -p gmsol-treasury --test gt_exchange_freeze \
+              -- --nocapture 2>&1 | tee poc-logs/freeze.log
+          # Expected tail: "test result: ok. 5 passed; 0 failed;
+          # 1 ignored". The 1 ignored is the Tier-2 positive
+          # control (oracle fixture TODO-VERIFY in the test file);
+          # ignored is EXPECTED, not a failure.
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: freeze-logs
+          path: poc-logs/
+          retention-days: 14
+          if-no-files-found: warn
+
+  # ------------------------------------------------------------------
+  # Referral suite: programs/store/tests/gt_referral_close_time.rs
+  # Expected: 4 passed (cases 1-4 in README-c1.md).
+  # ------------------------------------------------------------------
+  referral:
+    if: ${{ inputs.suite == 'both' || inputs.suite == 'referral' }}
+    name: referral (gt_referral_close_time)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - name: Check out fork at pinned ref
+        uses: actions/checkout@v4
+        with:
+          ref: a10a6599a42442aac2b4873fb058616a40e07f27
+
+      - name: Free disk space
+        run: |
+          mkdir -p poc-logs
+          { echo "=== before ==="; df -h /; } | tee poc-logs/disk.txt
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc "$HOME/.ghcup" || true
+          sudo rm -rf /usr/local/share/boost || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+          { echo "=== after ==="; df -h /; } | tee -a poc-logs/disk.txt
+
+      - name: Fetch poc-pack from the fork's default branch
+        run: |
+          git fetch --depth 1 origin "${{ github.ref_name }}"
+          git checkout FETCH_HEAD -- poc-pack
+          ls -la poc-pack
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-
+
+      - name: Cache target dir (referral)
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: target-referral-${{ env.GMSOL_REF }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            target-referral-${{ env.GMSOL_REF }}-
+        # Same 10 GB repo-wide cap caveat as the freeze job; the
+        # two jobs' target caches compete for it. Dropping this
+        # step is the first fix if saves start failing.
+
+      - name: Setup toolchain + install PoC files (codespaces setup.sh)
+        run: bash poc-pack/setup.sh
+
+      - name: Put toolchain on PATH for later steps
+        run: |
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build SBF programs (store only)
+        run: |
+          # The referral suite's ProgramTest registers gmsol_store
+          # (see program_test() in the test source).
+          # TODO-VERIFY #2 (header): if the fixture also needs the
+          # mock Chainlink verifier, note that the repo ships a
+          # prebuilt external-programs/chainlink-store.so (loaded
+          # from disk, no build) — only add a build-sbf line here
+          # if a built verifier program turns out to be required.
+          mkdir -p target/deploy
+          cargo build-sbf --manifest-path programs/store/Cargo.toml \
+            --sbf-out-dir target/deploy
+          ls -la target/deploy
+          df -h / | tee -a poc-logs/disk.txt
+
+      - name: Run referral suite
+        run: |
+          set -o pipefail
+          BPF_OUT_PATH="$PWD/target/deploy" \
+            cargo test -p gmsol-store --test gt_referral_close_time \
+              -- --nocapture 2>&1 | tee poc-logs/referral.log
+          # Expected tail: "test result: ok. 4 passed; 0 failed".
+          # Per README-c1.md: if Case 2 or Case 4 fails, suspect
+          # the fixture, not the finding; if Case 1/3 fail with
+          # 2/4 green, that is a genuine refutation — report it.
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: referral-logs
+          path: poc-logs/
+          retention-days: 14
+          if-no-files-found: warn
