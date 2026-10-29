@@ -792,11 +792,15 @@ async fn setup() -> Fixture {
     // Inserted tokens start with all flags cleared
     // (TokenConfig::default() is zeroed), so deposits/withdrawals must
     // be enabled explicitly.
-    // TODO-VERIFY: the exact flag strings parsed by
-    // `toggle_token_flag` (the `TokenFlag` variant names in
-    // gmsol-utils). If parsing fails, check the strum serialisation of
-    // `TokenFlag::{AllowDeposit, AllowWithdrawal}`.
-    for flag in ["AllowDeposit", "AllowWithdrawal"] {
+    // Flag strings are snake_case, NOT the Rust variant names:
+    // `TokenFlag` (crates/utils/src/token_config.rs) derives
+    // strum::EnumString with `#[strum(serialize_all = "snake_case")]`,
+    // so `toggle_token_flag`'s `flag.parse()` accepts only
+    // "allow_deposit"/"allow_withdrawal" and rejects "AllowDeposit"
+    // with InvalidArgument (6007) at treasury.rs:254 — this killed
+    // run #8. The SDK confirms the wire format: it sends
+    // `flag.to_string()` (strum Display, also snake_case).
+    for flag in ["allow_deposit", "allow_withdrawal"] {
         send_ok(
             &mut ctx,
             &[ix(
