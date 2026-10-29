@@ -127,6 +127,9 @@ pick() { # pick <filename> -> path
   elif [ -f "$PACK_DIR/../$1" ]; then echo "$PACK_DIR/../$1";
   else echo "ERROR: $1 not found in $PACK_DIR or its parent" >&2; exit 1; fi
 }
+# The upstream tree has no programs/*/tests/ directories (its tests live
+# elsewhere), so create the destinations first — run 40903481021 died here.
+mkdir -p programs/treasury/tests programs/store/tests
 cp "$(pick gt_exchange_freeze.rs)"    programs/treasury/tests/gt_exchange_freeze.rs
 cp "$(pick gt_referral_close_time.rs)" programs/store/tests/gt_referral_close_time.rs
 
