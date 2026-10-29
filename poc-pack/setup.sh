@@ -70,25 +70,51 @@ fi
 export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
 
 # ---------------------------------------------------------------- anchor
-echo "==> Anchor CLI 0.31.1"
-if command -v anchor >/dev/null 2>&1 && anchor --version | grep -q "0\.31\.1"; then
-  echo "    already at $(anchor --version)"
-else
-  # Fast route: avm (small) + prebuilt anchor-cli release binary.
-  # Building anchor-cli itself from source via
-  #   cargo install --git https://github.com/coral-xyz/anchor \
-  #     --tag v0.31.1 anchor-cli --locked
-  # is the run_poc.sh fallback — it works but takes much longer.
+# Anchor CLI is OPTIONAL for these PoCs — nothing in the build/test
+# path invokes it: the Actions workflows build the SBF programs with
+# `cargo build-sbf` and run the suites with plain `cargo test`, and
+# the tests themselves are solana-program-test integration tests
+# (they link the anchor *framework crates* as libraries; they never
+# shell out to the anchor CLI). `anchor build` survives only as a
+# documented fallback if cargo-build-sbf ever goes missing, and the
+# Codespaces venue's run_all.sh uses it. So this install is
+# BEST-EFFORT: try hard, but never let it fail the setup.
+#
+# Why the avm build below runs under a newer toolchain: avm is
+# compiled from source, and its dependency tree now contains
+# edition2024 crates that the pinned Rust 1.81.0 cargo cannot even
+# parse ("feature `edition2024` is required", exit 101 — observed
+# in Actions run 40901967661, where this step killed both jobs
+# before any test ran). Building avm with RUSTUP_TOOLCHAIN=stable
+# fixes that while leaving the rustup default at 1.81.0, so the
+# project build/test steps still use the pinned toolchain.
+# Building anchor-cli itself from source
+#   cargo install --git https://github.com/coral-xyz/anchor \
+#     --tag v0.31.1 anchor-cli --locked
+# remains the manual last resort (the run_poc.sh route) if the avm
+# route fails too.
+echo "==> Anchor CLI 0.31.1 (optional, best-effort)"
+install_anchor() {
   if ! command -v avm >/dev/null 2>&1; then
-    cargo install --git https://github.com/coral-xyz/anchor avm --locked --force
+    rustup toolchain install stable
+    RUSTUP_TOOLCHAIN=stable \
+      cargo install --git https://github.com/coral-xyz/anchor avm --locked --force
   fi
   export PATH="$HOME/.cargo/bin:$PATH"
-  # TODO-VERIFY: avm downloads the prebuilt anchor 0.31.1 binary from
-  # the anchor GitHub releases. If that download is unavailable in
-  # your environment, comment the next two lines and use the
-  # cargo-install fallback quoted above.
+  # avm downloads the prebuilt anchor 0.31.1 binary from the anchor
+  # GitHub releases (no compilation, so the toolchain pin is moot).
   avm install 0.31.1
   avm use 0.31.1
+}
+if command -v anchor >/dev/null 2>&1 && anchor --version | grep -q "0\.31\.1"; then
+  echo "    already at $(anchor --version)"
+elif ! install_anchor; then
+  # install_anchor is invoked in a condition, so `set -e` is
+  # suppressed inside it and any failure lands here instead of
+  # aborting the setup.
+  echo "WARNING: Anchor CLI install failed — continuing WITHOUT anchor." >&2
+  echo "         Safe for the Actions suites (cargo build-sbf + cargo test)." >&2
+  echo "         Only the Codespaces run_all.sh path (anchor build) needs it." >&2
 fi
 
 # ------------------------------------------------------------ PoC files
@@ -122,6 +148,7 @@ echo "==> Toolchain check"
 rustc --version
 cargo --version
 solana --version
-anchor --version
+# Anchor is optional (best-effort above): report, never fail on it.
+anchor --version || echo "anchor: not installed (optional — see the anchor section above)"
 echo "==> Repo at $(git rev-parse --short HEAD) (expect ${REPO_REF:0:7})"
 echo "==> Setup complete. Run the tests with:  bash poc-pack/run_all.sh"
