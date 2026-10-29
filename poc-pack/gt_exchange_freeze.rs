@@ -383,11 +383,39 @@ struct Fixture {
 /// stopping right before the GT exchange request, which differs per
 /// scenario.
 async fn setup() -> Fixture {
+    // solana-program-test 2.1 decides `prefer_bpf` at `ProgramTest`
+    // construction time from `BPF_OUT_DIR`/`SBF_OUT_DIR` ONLY — it never
+    // reads `BPF_OUT_PATH` (the variable the workflow and README use).
+    // With `prefer_bpf == false` and `processor == None`, `add_program`
+    // panics with "Program processor not available" before any test
+    // logic runs (this killed run #6: all 5 tests panicked identically
+    // inside `setup()`). Calling `prefer_bpf(true)` after construction
+    // cannot help because `ProgramTest::new` itself calls `add_program`,
+    // so the deploy directory must be visible under a name the harness
+    // reads BEFORE construction. Bridge it here; no-op when already set.
+    if std::env::var_os("BPF_OUT_DIR").is_none() && std::env::var_os("SBF_OUT_DIR").is_none() {
+        if let Some(dir) = std::env::var_os("BPF_OUT_PATH") {
+            std::env::set_var("BPF_OUT_DIR", dir);
+        } else if let Ok(exe) = std::env::current_exe() {
+            // Bare `cargo test` run: the test binary lives in
+            // <workspace>/target/debug/deps/, so the deploy dir is
+            // four ancestors up + target/deploy. Only use it when the
+            // store .so is actually there, so a missing build still
+            // fails with the harness's own "file data not available"
+            // panic instead of a silently wrong directory.
+            if let Some(ws) = exe.ancestors().nth(4) {
+                let deploy = ws.join("target/deploy");
+                if deploy.join("gmsol_store.so").exists() {
+                    std::env::set_var("BPF_OUT_DIR", &deploy);
+                }
+            }
+        }
+    }
     let mut program_test = ProgramTest::new("gmsol_store", gmsol_store::ID, None);
     program_test.add_program("gmsol_treasury", gmsol_treasury::ID, None);
     // NOTE: the SPL Token and Associated Token programs are included by
     // solana-program-test by default. The .so files are located via
-    // BPF_OUT_PATH or the workspace `target/deploy` (see README).
+    // BPF_OUT_DIR (bridged from BPF_OUT_PATH above) — see README.
     let mut ctx = program_test.start_with_context().await;
 
     let admin = ctx.payer.insecure_clone();
