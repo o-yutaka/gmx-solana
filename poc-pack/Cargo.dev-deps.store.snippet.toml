@@ -1,0 +1,35 @@
+# Append to programs/store/Cargo.toml (gmsol-labs/gmx-solana @ a10a659).
+#
+# NEW for the Codespaces pack: README-c1.md listed the referral test's
+# dev-dependencies only as a prose TODO-VERIFY list; this snippet turns
+# it into the same ready-to-append form as the treasury snippet.
+#
+# The integration test in programs/store/tests/ can already use the
+# package's normal [dependencies] (anchor-lang, gmsol-utils, bytemuck,
+# ...). What must be added is the test runtime plus the crates the test
+# references directly but the store package does not depend on itself:
+# solana-program-test, solana-sdk, anchor-spl (`anchor_spl::token::ID`
+# / `anchor_spl::associated_token::ID` in the test source).
+# `solana-program-test` re-exports tokio, which is how the test gets
+# its async runtime; the explicit tokio line below matches
+# README-c1.md's list and is harmless if already present via the
+# re-export.
+
+[dev-dependencies]
+solana-program-test = "2.1"
+solana-sdk = { workspace = true }
+anchor-spl = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+
+# Notes:
+# - TODO-VERIFY at first build: check the store crate's existing
+#   [dev-dependencies] in programs/store/Cargo.toml and the workspace
+#   Cargo.toml — if any of these entries already exist there, drop the
+#   duplicate instead of appending (setup.sh greps for
+#   "solana-program-test" in the target Cargo.toml and skips the whole
+#   snippet if it is already there).
+# - solana-program-test 2.1.x pairs with the workspace's solana 2.1.21
+#   toolchain (Anchor.toml), same as the treasury snippet.
+# - If anchor-spl is not a workspace dependency of this workspace,
+#   replace `{ workspace = true }` with the version the workspace uses
+#   for anchor-lang (0.31.1).

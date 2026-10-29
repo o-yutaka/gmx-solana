@@ -1,0 +1,19 @@
+# Append to programs/treasury/Cargo.toml (gmsol-labs/gmx-solana @ a10a659).
+#
+# The integration test in programs/treasury/tests/ can already use the
+# package's normal [dependencies] (anchor-lang, anchor-spl, gmsol-store,
+# gmsol-utils, bytemuck is also a normal dependency) — only the test
+# runtime itself needs to be added:
+
+[dev-dependencies]
+solana-program-test = "2.1"
+solana-sdk = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+bincode = { workspace = true }
+
+# Notes:
+# - solana-program-test 2.1.x pairs with the workspace's solana 2.1.21
+#   toolchain (Anchor.toml) and solana-sdk ">=2.1.0,<2.2.0" (workspace).
+# - If the resolved solana-program-test version pulls a different
+#   solana-sdk within the allowed range, pin both to the exact versions
+#   in the workspace Cargo.lock used by CI.
