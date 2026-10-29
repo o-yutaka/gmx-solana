@@ -18,23 +18,51 @@
 //!   to whoever is the referrer *then*. There is no referrer / rank /
 //!   factor snapshot on the Order account.
 //!
+//! MECHANISM CORRECTION (2026-10-30, see
+//! `gmtrade-c1-rebuttal-pack.md` top correction box + §4): an earlier
+//! version of this file claimed a referrer could be *switched* after
+//! execution. That is impossible at this ref —
+//! `Referral::set_referrer` is **set-once**: the state layer requires
+//! the current referrer to be unset
+//! (`programs/store/src/states/user.rs:221`,
+//! `CoreError::ReferrerHasBeenSet`; program docs
+//! `programs/store/src/lib.rs:3166`: "Must not already have a referrer
+//! set"; the only assignment to `Referral.referrer` in the program is
+//! `states/user.rs:228`), and there is no change/remove-referrer
+//! instruction. The diversion claim built on switching is withdrawn.
+//! What survives — and what the tests below exercise — is that the
+//! bonus is still bound entirely at close: the payee is whoever the
+//! (first-ever) referral binding names when the order closes, and the
+//! factor is that referrer's rank **at close**, neither of which is
+//! fixed when the reward is earned at execution.
+//!
 //! Consequences exercised by the tests below:
 //!
-//! * Case 1 (diversion — the High claim, "Theft of unclaimed yield"):
-//!   trader U executes while referred by genuine referrer X, then calls
-//!   `set_referrer` to their own alt B, then closes. B receives
-//!   `gt_reward × factor(rank_B)`; X — whose referral the protocol itself
-//!   used at execution for the discount leg — receives 0.
-//! * Case 2 (control): identical flow without the switch. X receives the
-//!   bonus. (By construction the *amount* equals Case 1's when X and B
-//!   are both rank 0; the diversion is proven by the payee deltas, not
-//!   by a total difference. See README-c1.md.)
-//! * Case 3 (creation from nothing): U executes with **no** referrer,
-//!   sets referrer = B, closes. B receives a bonus that, per Case 4,
-//!   would otherwise never be minted at all.
+//! * Case 1 (repricing — Form 3): trader U executes while referred by
+//!   X, who is rank 0 (factor 0.50) at execution. Before close, X's GT
+//!   balance rises across a rank threshold through X's own fee-paying
+//!   trades (rank is derived from balance and re-evaluated in
+//!   `GtState::mint_to`, `programs/store/src/states/gt.rs`). At close
+//!   X is paid `gt_reward × factor(rank at close)` — strictly more
+//!   than the execution-time terms — proving the bonus is repriced by
+//!   post-execution state.
+//! * Case 2 (control): identical flow with no post-execution change
+//!   of any kind. X receives `gt_reward × 0.50`. This is the honest
+//!   baseline Cases 1, 3 and 5 are each measured against.
+//! * Case 3 (creation from nothing — Form 1): U executes with **no**
+//!   referrer, then makes their **first-ever** `set_referrer` call
+//!   (to B), then closes. B receives a bonus that, per Case 4, would
+//!   otherwise never be minted at all — a referral bonus for a trade
+//!   executed before any referral existed.
 //! * Case 4 (control): U executes unreferred and closes unreferred.
 //!   `mint_gt_reward_for_referrer` early-returns on `referrer == None`;
 //!   zero GT is minted at close.
+//! * Case 5 (negative — the set-once guard): after a first
+//!   `set_referrer` to X, a second `set_referrer` (to B — the old
+//!   "switch") reverts with `ReferrerHasBeenSet`, and the subsequent
+//!   close still pays X, not B. This documents the guard the
+//!   correction rests on and proves the suite models the actual
+//!   mechanism.
 //!
 //! Placement: `programs/store/tests/gt_referral_close_time.rs` inside a
 //! checkout of `gmsol-labs/gmx-solana` at the analysed ref
@@ -109,9 +137,18 @@ pub const REFERRAL_REWARD_FACTORS: [u128; 10] = [
     MARKET_USD_UNIT * 95 / 100,
     MARKET_USD_UNIT,
 ];
-/// Rank-0 referral factor (0.50) — X and B both start at rank 0, so every
-/// case below asserts against this single factor. No rank farming needed.
+/// Rank-0 referral factor (0.50) — X and B both start at rank 0, so the
+/// control cases assert against this single factor.
 pub const FACTOR_RANK_0: u128 = REFERRAL_REWARD_FACTORS[0];
+/// Rank-1 referral factor (0.60) — the first repricing step above
+/// rank 0. Case 1 asserts against `REFERRAL_REWARD_FACTORS[rank]`
+/// indexed by X's *actual* rank at close (≥ 1), so this constant is
+/// documentary; the table lookup is the assertion.
+pub const FACTOR_RANK_1: u128 = REFERRAL_REWARD_FACTORS[1];
+/// First rank threshold in GT base units: a GT balance of at least
+/// this much is rank ≥ 1 (`GtState::unchecked_update_rank` binary
+/// search over the thresholds configured in `initialize_gt`).
+pub const RANK_1_THRESHOLD: u64 = RANK_THRESHOLDS_WHOLE_GT[0] * GT_UNIT;
 /// Deployed order-fee discount factors, rank 0..=9: 0%, 2%, …, 10%.
 /// Not load-bearing for any assertion (the discount leg is not measured);
 /// included so the executed order's fee path matches production shape.
@@ -395,7 +432,7 @@ pub struct Fixture {
     pub store: Pubkey,
     pub admin: Keypair,
     pub keeper: Keypair,
-    /// Trader "U" — the referee whose referrer is switched.
+    /// Trader "U" — the referee in every lifecycle below.
     pub trader: Keypair,
     /// Genuine referrer "X".
     pub referrer_x: Keypair,
@@ -801,9 +838,17 @@ pub async fn seed_market_vaults(
 /// `programs/store/src/instructions/user.rs::SetReferrer`.
 /// Guards (for the record): `referrer_user.key() != user.key()`
 /// (SelfReferral — a second wallet passes), the referrer's recorded
-/// referrer must not be the trader (MutualReferral). Nothing checks
-/// *when* the referrer is set relative to order execution — that is
-/// the bug.
+/// referrer must not be the trader (MutualReferral) — and, at the
+/// state layer, the trader's current referrer must be **unset**:
+/// `Referral::set_referrer` requires
+/// `self.referrer == DEFAULT_PUBKEY`, else `ReferrerHasBeenSet`
+/// (`programs/store/src/states/user.rs:221`; sole assignment at
+/// `:228`). So this instruction can attach a referrer exactly once
+/// per user account, and can never change one. What no guard checks
+/// is *when* that one call happens relative to order execution —
+/// a first-ever call made after execution still binds the bonuses
+/// of already-executed orders (Case 3), and a second call reverts
+/// (Case 5). That timing gap is the surviving bug.
 pub async fn set_referrer(
     ctx: &mut solana_program_test::ProgramTestContext,
     fx: &Fixture,
@@ -825,12 +870,16 @@ pub async fn set_referrer(
 /// `create_order_v2` for a market-increase, long, collateral = long token.
 /// Accounts from `instructions/exchange/order.rs::CreateOrderV2`.
 /// Remaining accounts: none (swap path length 0).
+/// `owner` is the order's owner/signer — the trader in the case
+/// lifecycles, or X in Case 1's rank-boost loop (X's own fee-paying
+/// trades are what raise X's GT balance, exactly as in production).
 pub async fn create_order(
     ctx: &mut solana_program_test::ProgramTestContext,
     fx: &Fixture,
+    owner_kp: &Keypair,
     nonce: [u8; 32],
 ) -> Result<Pubkey, Box<dyn std::error::Error>> {
-    let owner = fx.trader.pubkey();
+    let owner = owner_kp.pubkey();
     let order = order_pda(&fx.store, &owner, &nonce);
     // TODO-VERIFY: `PositionKind::Long` discriminant byte in the
     // position PDA seeds (from `params.to_position_kind()`; the kind is
@@ -894,19 +943,22 @@ pub async fn create_order(
         valid_from_ts: None,
     };
     let args = gmsol_store::instruction::CreateOrderV2 { nonce, params };
-    send(&mut ctx.banks_client, &fx.trader, &[], vec![ix!(accounts, args)]).await?;
+    send(&mut ctx.banks_client, owner_kp, &[], vec![ix!(accounts, args)]).await?;
     Ok(order)
 }
 
 /// `execute_increase_or_swap_order_v2` by the keeper.
 /// Accounts from `instructions/exchange/execute_order.rs`.
 /// Remaining accounts: the price-feed accounts (no swap path).
+/// `owner` is the order's owner (the trader, or X in Case 1's boost
+/// loop); the keeper signs regardless.
 pub async fn execute_order(
     ctx: &mut solana_program_test::ProgramTestContext,
     fx: &Fixture,
+    owner: &Pubkey,
     order: &Pubkey,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let owner = fx.trader.pubkey();
+    let owner = *owner;
     let collateral_escrow = associated_token_address(order, &fx.long_token);
     let accounts = gmsol_store::accounts::ExecuteIncreaseOrSwapOrderV2 {
         authority: fx.keeper.pubkey(),
@@ -977,8 +1029,10 @@ pub async fn execute_order(
 /// Accounts source-verified in `instructions/exchange/order.rs::CloseOrderV2`.
 /// `referrer_at_close` is the owner key of whoever
 /// `user.referral().referrer()` names *at close time* — the account
-/// constraint re-reads it from the User account, so this must match the
-/// post-switch state. That is precisely the mechanism under test.
+/// constraint re-reads it from the User account, so this must match
+/// the referral state as it stands when the close is sent (set before
+/// execution, first set after execution, or never). That re-read is
+/// precisely the mechanism under test.
 pub async fn close_order(
     ctx: &mut solana_program_test::ProgramTestContext,
     fx: &Fixture,
@@ -1068,13 +1122,16 @@ pub struct CaseOutcome {
 }
 
 /// Full lifecycle: [set initial referrer] → create → execute →
-/// [switch referrer] → close, with formula cross-checks at execution.
+/// [first-ever `set_referrer`, Case 3's post-execution attach] →
+/// close, with formula cross-checks at execution. Cases 2 and 4 pass
+/// `None` for both referral steps. (Case 1 uses its own driver,
+/// `run_case_rank_repricing`; Case 5 drives the helpers directly.)
 pub async fn run_case(
     ctx: &mut solana_program_test::ProgramTestContext,
     fx: &Fixture,
     nonce: [u8; 32],
     initial_referrer: Option<([u8; 8], &Pubkey)>,
-    switch_to: Option<([u8; 8], &Pubkey)>,
+    attach_after_execution: Option<([u8; 8], &Pubkey)>,
 ) -> Result<CaseOutcome, Box<dyn std::error::Error>> {
     let trader_owner = fx.trader.pubkey();
     let x_owner = fx.referrer_x.pubkey();
@@ -1088,9 +1145,9 @@ pub async fn run_case(
     let trader_before = gt_snapshot(&mut ctx.banks_client, &fx.store, &trader_owner).await?;
     let (_, _, minting_cost_before) = gt_globals(&mut ctx.banks_client, &fx.store).await?;
 
-    let order = create_order(ctx, fx, nonce).await?;
+    let order = create_order(ctx, fx, &fx.trader, nonce).await?;
     post_mock_prices(ctx, fx).await?;
-    execute_order(ctx, fx, &order).await?;
+    execute_order(ctx, fx, &trader_owner, &order).await?;
 
     let trader_after_exec = gt_snapshot(&mut ctx.banks_client, &fx.store, &trader_owner).await?;
     let (_, _, minting_cost_after) = gt_globals(&mut ctx.banks_client, &fx.store).await?;
@@ -1122,8 +1179,10 @@ pub async fn run_case(
         "trader's own GT is minted at execution"
     );
 
-    // --- Switch (the attack step; a plain user instruction) ------------------
-    if let Some((code, referrer_owner)) = switch_to {
+    // --- Attach (Case 3 only: the account's FIRST-EVER set_referrer,
+    // sent after execution; the set-once guard permits it because no
+    // referrer was ever set — see Case 5 for the second-call revert) ---
+    if let Some((code, referrer_owner)) = attach_after_execution {
         set_referrer(ctx, fx, &fx.trader, code, referrer_owner).await?;
     }
 
@@ -1133,7 +1192,7 @@ pub async fn run_case(
     let (supply_before, _, _) = gt_globals(&mut ctx.banks_client, &fx.store).await?;
 
     // Whoever is referrer *now* determines the close's referrer_user.
-    let referrer_at_close = match (switch_to, initial_referrer) {
+    let referrer_at_close = match (attach_after_execution, initial_referrer) {
         (Some((_, owner)), _) => Some(*owner),
         (None, Some((_, owner))) => Some(*owner),
         (None, None) => None,
@@ -1163,6 +1222,179 @@ pub async fn run_case(
     })
 }
 
+// ===========================================================================
+// Case 1 machinery — rank repricing (Form 3)
+// ===========================================================================
+
+/// Upper bound on the number of X's own orders used to lift X across
+/// the rank-1 threshold. Calibration only: the loop stops as soon as
+/// the observed rank is ≥ 1, and the assertions are indexed by the
+/// *observed* rank, never by an assumed factor. See README-c1.md
+/// TODO-VERIFY #15 for the fee-calibration note.
+pub const MAX_BOOST_ORDERS: usize = 12;
+
+/// Raise `referrer`'s GT balance across the rank-1 threshold using
+/// only the production path: the referrer executes fee-paying orders
+/// of their own, and each execution mints GT to them via
+/// `Order::unchecked_process_gt` → `GtState::mint_to` — the same call
+/// that re-evaluates rank from balance
+/// (`programs/store/src/states/gt.rs`, `unchecked_update_rank`).
+/// No fixture-only mint, no state forgery: if the program derived
+/// rank any other way, this would not move it. The boost orders are
+/// left open (execution alone mints; nothing here needs their close).
+///
+/// Returns X's rank after the boost. Asserts the rank actually rose.
+pub async fn boost_referrer_rank(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    fx: &Fixture,
+    referrer: &Keypair,
+) -> Result<u8, Box<dyn std::error::Error>> {
+    let payer = ctx.payer.insecure_clone();
+    // Collateral for every boost order up front (each execution moves
+    // COLLATERAL_AMOUNT from the ATA into the order escrow).
+    // TODO-VERIFY: `fund_collateral` mints into a fresh ATA; funding
+    // MAX_BOOST_ORDERS × COLLATERAL_AMOUNT in one call must land in
+    // the same ATA the create instruction debits.
+    fund_collateral(
+        ctx,
+        &payer,
+        &referrer.pubkey(),
+        &fx.long_token,
+        COLLATERAL_AMOUNT * MAX_BOOST_ORDERS as u64,
+    )
+    .await?;
+
+    let referrer_owner = referrer.pubkey();
+    let mut rank = gt_snapshot(&mut ctx.banks_client, &fx.store, &referrer_owner)
+        .await?
+        .rank;
+    for i in 0..MAX_BOOST_ORDERS {
+        if rank >= 1 {
+            break;
+        }
+        let mut nonce = [0u8; 32];
+        nonce[0] = 0xB0;
+        nonce[31] = i as u8;
+        let order = create_order(ctx, fx, referrer, nonce).await?;
+        post_mock_prices(ctx, fx).await?;
+        execute_order(ctx, fx, &referrer_owner, &order).await?;
+        rank = gt_snapshot(&mut ctx.banks_client, &fx.store, &referrer_owner)
+            .await?
+            .rank;
+    }
+    assert!(
+        rank >= 1,
+        "boost must lift the referrer to rank >= 1 (balance >= {RANK_1_THRESHOLD} base units); \
+         if the fixture's per-order fees mint too little GT, this is calibration — see README-c1.md TODO-VERIFY #15"
+    );
+    Ok(rank)
+}
+
+pub struct RepricingOutcome {
+    /// `order.gt_reward` recorded at execution (GT base units).
+    pub gt_reward: u64,
+    /// X's rank snapshotted at execution time (expected 0).
+    pub x_rank_at_execution: u8,
+    /// X's rank snapshotted immediately before the close (≥ 1).
+    pub x_rank_at_close: u8,
+    /// GT ledger delta of X across the close.
+    pub x_delta_close: u64,
+    /// GT ledger delta of B across the close (expected 0).
+    pub b_delta_close: u64,
+    /// GT ledger delta of the trader across the close (expected 0).
+    pub trader_delta_close: u64,
+    /// `GtState.supply` delta across the close.
+    pub supply_delta_close: u64,
+}
+
+/// Case 1 lifecycle: set referrer X (rank 0) → create → execute →
+/// boost X's rank via X's own trades → close. The only difference
+/// from the Case 2 control is X's post-execution balance movement.
+pub async fn run_case_rank_repricing(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    fx: &Fixture,
+    nonce: [u8; 32],
+) -> Result<RepricingOutcome, Box<dyn std::error::Error>> {
+    let trader_owner = fx.trader.pubkey();
+    let x_owner = fx.referrer_x.pubkey();
+    let b_owner = fx.referrer_b.pubkey();
+
+    // Referral binding is in place BEFORE execution (the honest flow),
+    // with X at rank 0: the execution-time terms are factor 0.50.
+    set_referrer(ctx, fx, &fx.trader, CODE_X, &x_owner).await?;
+    let x_at_execution = gt_snapshot(&mut ctx.banks_client, &fx.store, &x_owner).await?;
+    assert_eq!(x_at_execution.rank, 0, "X must be rank 0 at execution");
+    assert_eq!(x_at_execution.amount, 0, "fresh referrer holds no GT at execution");
+
+    // --- Execute (mirrors run_case's formula cross-checks) -------------------
+    let trader_before = gt_snapshot(&mut ctx.banks_client, &fx.store, &trader_owner).await?;
+    let (_, _, minting_cost_before) = gt_globals(&mut ctx.banks_client, &fx.store).await?;
+
+    let order = create_order(ctx, fx, &fx.trader, nonce).await?;
+    post_mock_prices(ctx, fx).await?;
+    execute_order(ctx, fx, &trader_owner, &order).await?;
+
+    let trader_after_exec = gt_snapshot(&mut ctx.banks_client, &fx.store, &trader_owner).await?;
+    let order_state = load_zero_copy::<gmsol_store::states::Order>(&mut ctx.banks_client, &order).await?;
+    let gt_reward = order_state.gt_reward;
+    let expected = expected_gt_reward(
+        trader_before.paid_fee_value,
+        trader_before.minted_fee_value,
+        trader_after_exec.paid_fee_value,
+        minting_cost_before,
+    );
+    assert!(gt_reward > 0, "order must have paid fees and earned GT");
+    assert_eq!(gt_reward, expected, "order.gt_reward must equal fee_value / minting_cost");
+    assert_eq!(
+        trader_after_exec.amount - trader_before.amount,
+        gt_reward,
+        "trader's own GT is minted at execution"
+    );
+
+    // --- Reprice: X's balance crosses a rank threshold AFTER execution ------
+    let x_rank_at_close = boost_referrer_rank(ctx, fx, &fx.referrer_x).await?;
+    let x_before_close = gt_snapshot(&mut ctx.banks_client, &fx.store, &x_owner).await?;
+    assert_eq!(x_before_close.rank, x_rank_at_close);
+    assert!(
+        x_before_close.amount >= RANK_1_THRESHOLD,
+        "X's balance must actually sit above the rank-1 threshold at close"
+    );
+    // The trader's order, its gt_reward, and the minting cost are all
+    // untouched by the boost; only the factor the close will read has
+    // moved. (X's boost mints stay far below the 210,000 GT grow step.)
+    let (_, _, minting_cost_at_close) = gt_globals(&mut ctx.banks_client, &fx.store).await?;
+    assert_eq!(
+        minting_cost_before, minting_cost_at_close,
+        "fixture must not cross a GT grow step mid-case"
+    );
+    let order_state = load_zero_copy::<gmsol_store::states::Order>(&mut ctx.banks_client, &order).await?;
+    assert_eq!(order_state.gt_reward, gt_reward, "the earned base must not move after execution");
+
+    // --- Close ---------------------------------------------------------------
+    let b_before = gt_snapshot(&mut ctx.banks_client, &fx.store, &b_owner).await?;
+    let (supply_before, _, _) = gt_globals(&mut ctx.banks_client, &fx.store).await?;
+    close_order(ctx, fx, &order, Some(&x_owner)).await?;
+
+    let x_after = gt_snapshot(&mut ctx.banks_client, &fx.store, &x_owner).await?;
+    let b_after = gt_snapshot(&mut ctx.banks_client, &fx.store, &b_owner).await?;
+    let trader_after_close = gt_snapshot(&mut ctx.banks_client, &fx.store, &trader_owner).await?;
+    let (supply_after, _, _) = gt_globals(&mut ctx.banks_client, &fx.store).await?;
+    assert!(
+        ctx.banks_client.get_account(order).await?.is_none(),
+        "order account must be closed"
+    );
+
+    Ok(RepricingOutcome {
+        gt_reward,
+        x_rank_at_execution: x_at_execution.rank,
+        x_rank_at_close,
+        x_delta_close: x_after.amount - x_before_close.amount,
+        b_delta_close: b_after.amount - b_before.amount,
+        trader_delta_close: trader_after_close.amount - trader_after_exec.amount,
+        supply_delta_close: supply_after - supply_before,
+    })
+}
+
 pub fn program_test() -> ProgramTest {
     // TODO-VERIFY: register the mock Chainlink verifier `.so` here if
     // `setup_oracle_and_tokens` requires it
@@ -1175,39 +1407,58 @@ pub fn program_test() -> ProgramTest {
 // Tests
 // ===========================================================================
 
-/// Case 1 — DIVERSION (the High claim). U executes referred by X
-/// (the protocol evaluates X for the execution-time discount), then
-/// switches referrer to own alt B, then closes.
-/// Expected: B is minted `gt_reward × 0.50` (rank 0, deployed table);
-/// X — the referrer of record when the reward was *earned* — gets 0.
+/// Case 1 — RANK REPRICING (Form 3). U executes referred by X while
+/// X is rank 0, so the terms in force when the reward is *earned*
+/// are factor 0.50. Before close, X's GT balance rises across the
+/// rank-1 threshold through X's own fee-paying trades (the
+/// production rank path: balance-derived, re-evaluated in
+/// `mint_to`). The close then pays X at the **close-time** factor.
+/// Expected: X is minted `gt_reward × factor(rank at close)` with
+/// rank at close ≥ 1 — strictly more than
+/// `gt_reward × 0.50`, the execution-time terms. Nothing about the
+/// order changed after execution; only the state the close reads.
+/// (This case replaces the withdrawn switch/diversion case — see
+/// the file header's correction note and Case 5.)
 #[tokio::test]
-async fn case_1_referrer_switch_before_close_diverts_bonus_to_alt() {
+async fn case_1_rank_rise_before_close_reprices_bonus_upward() {
     let mut ctx = program_test().start_with_context().await;
     let fx = setup_fixture(&mut ctx).await.expect("fixture");
-    let out = run_case(
-        &mut ctx,
-        &fx,
-        [0xC1; 32],
-        Some((CODE_X, &fx.referrer_x.pubkey())),
-        Some((CODE_B, &fx.referrer_b.pubkey())),
-    )
-    .await
-    .expect("lifecycle");
+    let out = run_case_rank_repricing(&mut ctx, &fx, [0xC1; 32])
+        .await
+        .expect("lifecycle");
 
-    let expected_bonus = expected_referral_bonus(out.gt_reward, FACTOR_RANK_0);
-    assert!(expected_bonus > 0);
-    assert_eq!(out.b_delta_close, expected_bonus, "alt B must receive the diverted bonus");
-    assert_eq!(out.x_delta_close, 0, "genuine referrer X must receive nothing");
-    assert_eq!(out.supply_delta_close, expected_bonus, "close mints exactly the bonus");
+    assert_eq!(out.x_rank_at_execution, 0, "execution-time terms are the rank-0 factor");
+    assert!(
+        out.x_rank_at_close > out.x_rank_at_execution,
+        "the boost must actually reprice the close"
+    );
+    // Formula-derived from the code, indexed by the OBSERVED rank at
+    // close — never a hardcoded total:
+    //   reward = apply_factor(gt_reward, referral_reward_factor(rank_at_close))
+    let factor_at_close = REFERRAL_REWARD_FACTORS[out.x_rank_at_close as usize];
+    let expected_bonus = expected_referral_bonus(out.gt_reward, factor_at_close);
+    let execution_time_bonus = expected_referral_bonus(out.gt_reward, FACTOR_RANK_0);
+    assert!(expected_bonus > execution_time_bonus, "repricing must be upward in this case");
+    assert_eq!(
+        out.x_delta_close, expected_bonus,
+        "close must pay the close-time factor, not the execution-time factor"
+    );
+    assert!(
+        out.x_delta_close > execution_time_bonus,
+        "X receives more than the terms in force when the reward was earned"
+    );
+    assert_eq!(out.b_delta_close, 0);
+    assert_eq!(out.supply_delta_close, expected_bonus, "close mints exactly the repriced bonus");
     assert_eq!(out.trader_delta_close, 0);
 }
 
-/// Case 2 — CONTROL (no switch). Same flow, referrer stays X.
-/// Expected: X receives `gt_reward × 0.50`; B receives 0. Together with
-/// Case 1 this isolates the post-execution `set_referrer` as the sole
-/// cause of the diversion. (Amounts in Cases 1 and 2 are equal by
-/// construction — both referrers are rank 0 — so the proof is in the
-/// payee deltas, not in a total-minted difference.)
+/// Case 2 — CONTROL (honest baseline). Referrer X is set before
+/// execution and nothing changes afterwards; X is rank 0 throughout.
+/// Expected: X receives `gt_reward × 0.50`; B receives 0. This is
+/// the flow the referral program intends, and the baseline that
+/// Case 1 (same flow + X's balance moves), Case 3 (same flow + the
+/// binding is created after execution) and Case 5 (same flow + a
+/// failed attempt to move the binding) are each measured against.
 #[tokio::test]
 async fn case_2_no_switch_pays_genuine_referrer() {
     let mut ctx = program_test().start_with_context().await;
@@ -1230,11 +1481,14 @@ async fn case_2_no_switch_pays_genuine_referrer() {
     assert_eq!(out.trader_delta_close, 0);
 }
 
-/// Case 3 — CREATION FROM NOTHING. U executes with **no** referrer
-/// (at execution, no referral bonus can ever arise), then sets
-/// referrer = B, then closes.
+/// Case 3 — CREATION FROM NOTHING (Form 1). U executes with **no**
+/// referrer (at execution, no referral bonus can ever arise), then
+/// makes their **first-ever** `set_referrer` call (referrer = B) —
+/// permitted precisely because the set-once guard only forbids a
+/// *second* set — then closes.
 /// Expected: B is minted `gt_reward × 0.50` — a bonus created purely
-/// by the post-execution `set_referrer`. Case 4 is the counterfactual.
+/// by the post-execution attach, for a referral that did not exist
+/// when the fees were earned. Case 4 is the counterfactual.
 #[tokio::test]
 async fn case_3_unreferred_execution_then_set_referrer_creates_bonus() {
     let mut ctx = program_test().start_with_context().await;
@@ -1276,4 +1530,95 @@ async fn case_4_no_referrer_no_bonus() {
     assert_eq!(out.x_delta_close, 0);
     assert_eq!(out.supply_delta_close, 0, "no referral GT may be minted at close");
     assert_eq!(out.trader_delta_close, 0);
+}
+
+/// Case 5 — NEGATIVE (the set-once guard). U's first `set_referrer`
+/// (to X) succeeds. A second `set_referrer` (to B — the "switch" the
+/// withdrawn diversion claim relied on) must revert with
+/// `ReferrerHasBeenSet` (`programs/store/src/states/user.rs:221`),
+/// and the binding must be observably unmoved afterwards: the
+/// lifecycle's close pays X, not B. This case documents the guard
+/// the 2026-10-30 correction rests on — a suite that still believed
+/// in switching would fail here, which is the point: the suite
+/// models the mechanism as it actually is.
+#[tokio::test]
+async fn case_5_second_set_referrer_reverts_referrer_has_been_set() {
+    let mut ctx = program_test().start_with_context().await;
+    let fx = setup_fixture(&mut ctx).await.expect("fixture");
+    let trader_owner = fx.trader.pubkey();
+    let x_owner = fx.referrer_x.pubkey();
+    let b_owner = fx.referrer_b.pubkey();
+
+    // First-ever set: succeeds. This is the only set this user
+    // account will ever accept.
+    set_referrer(&mut ctx, &fx, &fx.trader, CODE_X, &x_owner)
+        .await
+        .expect("first set_referrer must succeed");
+
+    // Second set (the switch attempt): must revert.
+    let err = set_referrer(&mut ctx, &fx, &fx.trader, CODE_B, &b_owner)
+        .await
+        .expect_err("second set_referrer must revert with ReferrerHasBeenSet");
+    let err_text = format!("{err:?}");
+    assert!(
+        err_text.contains("Custom"),
+        "expected an Anchor custom program error (ReferrerHasBeenSet), got: {err_text}"
+    );
+    // TODO-VERIFY: the exact numeric Anchor error code for
+    // `CoreError::ReferrerHasBeenSet` (6000 + the variant's index in
+    // the `CoreError` enum — see README-c1.md item 16). Once pinned
+    // at first build, strengthen the assert above to
+    // `err_text.contains("Custom(<code>)")`. The behavioural half
+    // below pins the guard regardless of the code's value.
+
+    // Behavioural proof the binding still names X: run the lifecycle
+    // and close — X is paid the rank-0 bonus, B is paid nothing,
+    // exactly as in the Case 2 control.
+    let trader_before = gt_snapshot(&mut ctx.banks_client, &fx.store, &trader_owner)
+        .await
+        .expect("snapshot");
+    let order = create_order(&mut ctx, &fx, &fx.trader, [0xC5; 32])
+        .await
+        .expect("create order");
+    post_mock_prices(&mut ctx, &fx).await.expect("prices");
+    execute_order(&mut ctx, &fx, &trader_owner, &order)
+        .await
+        .expect("execute order");
+    let trader_after_exec = gt_snapshot(&mut ctx.banks_client, &fx.store, &trader_owner)
+        .await
+        .expect("snapshot");
+    let order_state = load_zero_copy::<gmsol_store::states::Order>(&mut ctx.banks_client, &order)
+        .await
+        .expect("load order");
+    let gt_reward = order_state.gt_reward;
+    assert!(gt_reward > 0, "the order did earn GT for the trader");
+    assert_eq!(
+        trader_after_exec.amount - trader_before.amount, gt_reward,
+        "trader's own GT is minted at execution"
+    );
+
+    let x_before = gt_snapshot(&mut ctx.banks_client, &fx.store, &x_owner)
+        .await
+        .expect("snapshot");
+    let b_before = gt_snapshot(&mut ctx.banks_client, &fx.store, &b_owner)
+        .await
+        .expect("snapshot");
+    assert_eq!(x_before.rank, 0, "X must be rank 0 at close");
+    close_order(&mut ctx, &fx, &order, Some(&x_owner))
+        .await
+        .expect("close must pay the original referrer");
+
+    let x_after = gt_snapshot(&mut ctx.banks_client, &fx.store, &x_owner)
+        .await
+        .expect("snapshot");
+    let b_after = gt_snapshot(&mut ctx.banks_client, &fx.store, &b_owner)
+        .await
+        .expect("snapshot");
+    let expected_bonus = expected_referral_bonus(gt_reward, FACTOR_RANK_0);
+    assert!(expected_bonus > 0);
+    assert_eq!(
+        x_after.amount - x_before.amount, expected_bonus,
+        "the failed switch must leave the binding — and the payout — with X"
+    );
+    assert_eq!(b_after.amount - b_before.amount, 0, "B must receive nothing");
 }
